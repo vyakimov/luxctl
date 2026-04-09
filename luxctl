@@ -1,0 +1,1167 @@
+#!/usr/bin/env python3
+"""LLM-friendly Philips Hue CLI."""
+
+from __future__ import annotations
+
+import argparse
+import http.client
+import json
+import os
+import re
+import socket
+import ssl
+import sys
+from pathlib import Path
+from typing import Any
+
+
+API_VERSION = "clip/v2"
+DEFAULT_CONFIG_PATH = Path.home() / ".openhue" / "config.yaml"
+DEFAULT_CONNECT_TIMEOUT = 5.0
+DEFAULT_READ_TIMEOUT = 10.0
+
+HELP_TREE: dict[str, Any] = {
+    "command": "luxctl",
+    "description": "JSON-only Philips Hue CLI for LLM callers.",
+    "subcommands": {
+        "list-actions": {
+            "description": "List supported actions and parameters.",
+        },
+        "schema": {
+            "description": "Return a stable machine-readable command schema.",
+        },
+        "get": {
+            "description": "Fetch rooms, lights, or scenes.",
+            "subcommands": {
+                "light": {
+                    "description": "Get one light by id/name or list all lights.",
+                    "selectors": ["--id", "--name"],
+                },
+                "room": {
+                    "description": "Get one room by id/name or list all rooms.",
+                    "selectors": ["--id", "--name"],
+                },
+                "scene": {
+                    "description": "Get one scene by id/name or list all scenes.",
+                    "selectors": ["--id", "--name", "--room-id", "--room-name"],
+                },
+            },
+        },
+        "set": {
+            "description": "Mutate lights, rooms, or scenes.",
+            "subcommands": {
+                "light": {
+                    "description": "Set one shared light state payload on one or more lights.",
+                    "selectors": ["--id (repeatable)", "--name (repeatable)"],
+                    "fields": ["--on", "--brightness", "--mirek", "--xy", "--hex"],
+                },
+                "room": {
+                    "description": "Set state for all mutable lights in a room.",
+                    "selectors": ["--id", "--name"],
+                    "fields": [
+                        "--on",
+                        "--brightness",
+                        "--mirek",
+                        "--xy",
+                        "--hex",
+                        "--exclude",
+                    ],
+                },
+                "scene": {
+                    "description": "Recall a scene.",
+                    "selectors": ["--id", "--name", "--room-id", "--room-name"],
+                    "fields": ["--action", "--duration-ms"],
+                },
+            },
+        },
+    },
+    "global_options": {
+        "--config": "Path to config YAML with bridge/key entries.",
+        "--bridge": "Override bridge IP or hostname.",
+        "--key": "Override Hue application key.",
+        "--connect-timeout": "HTTP connect timeout in seconds.",
+        "--read-timeout": "HTTP read timeout in seconds.",
+        "--dry-run": "Validate mutating command and return planned writes without sending them.",
+        "--input-json": "Structured JSON mutation payload passed inline.",
+        "--input": "Structured JSON mutation payload from a file path or '-' for stdin.",
+        "--help": "Return this help as JSON.",
+    },
+}
+
+SCHEMA: dict[str, Any] = {
+    "version": 1,
+    "actions": [
+        {
+            "name": "list-actions",
+            "description": "List supported top-level actions and parameters.",
+            "mutates_state": False,
+        },
+        {
+            "name": "schema",
+            "description": "Return the stable command schema.",
+            "mutates_state": False,
+        },
+        {
+            "name": "get.light",
+            "description": "Get one light by id/name or list all lights.",
+            "mutates_state": False,
+            "required": [],
+            "optional": ["id", "name"],
+        },
+        {
+            "name": "get.room",
+            "description": "Get one room by id/name or list all rooms.",
+            "mutates_state": False,
+            "required": [],
+            "optional": ["id", "name"],
+        },
+        {
+            "name": "get.scene",
+            "description": "Get one scene by id/name or list all scenes.",
+            "mutates_state": False,
+            "required": [],
+            "optional": ["id", "name", "room_id", "room_name"],
+        },
+        {
+            "name": "set.light",
+            "description": "Set one shared payload on one or more lights by id/name.",
+            "mutates_state": True,
+            "required": ["at_least_one_selector", "at_least_one_state_field"],
+            "optional": ["ids", "names", "on", "brightness", "mirek", "xy", "hex", "dry_run", "input_json", "input"],
+        },
+        {
+            "name": "set.room",
+            "description": "Set all mutable lights in a room, optionally excluding named lights.",
+            "mutates_state": True,
+            "required": ["selector", "at_least_one_state_field"],
+            "optional": ["on", "brightness", "mirek", "xy", "hex", "exclude", "dry_run", "input_json", "input"],
+        },
+        {
+            "name": "set.scene",
+            "description": "Recall a scene by id/name.",
+            "mutates_state": True,
+            "required": ["selector"],
+            "optional": ["room_id", "room_name", "action", "duration_ms", "dry_run", "input_json", "input"],
+        },
+    ],
+    "error_types": [
+        "invalid_arguments",
+        "config_not_found",
+        "config_invalid",
+        "bridge_unreachable",
+        "authentication_failed",
+        "api_rejected_request",
+        "resource_not_found",
+        "ambiguous_match",
+        "timeout",
+        "unexpected_response",
+    ],
+    "json_input": {
+        "transport": {
+            "inline": "--input-json '{...}'",
+            "stdin": "echo '{...}' | luxctl --input -",
+        },
+        "actions": {
+            "set_light": {
+                "targets": {"ids": ["..."], "names": ["..."]},
+                "payload": {"on": True, "brightness": 40, "mirek": 300, "hex": "#800080", "xy": [0.27, 0.11]},
+                "dry_run": False,
+            },
+            "set_room": {
+                "target": {"id": "...", "name": "Bedroom"},
+                "payload": {"on": True},
+                "exclude": ["Bedroom Boy"],
+                "dry_run": True,
+            },
+            "set_scene": {
+                "target": {"id": "...", "name": "Relax", "room_id": "...", "room_name": "Bedroom"},
+                "payload": {"action": "active", "duration_ms": 1000},
+                "dry_run": False,
+            },
+        },
+    },
+}
+
+CSS_COLOR_NAMES = {
+    "black": "#000000",
+    "white": "#ffffff",
+    "red": "#ff0000",
+    "green": "#008000",
+    "blue": "#0000ff",
+    "yellow": "#ffff00",
+    "orange": "#ffa500",
+    "purple": "#800080",
+    "pink": "#ffc0cb",
+    "cyan": "#00ffff",
+    "magenta": "#ff00ff",
+    "warmwhite": "#ffd6aa",
+    "coolwhite": "#f3f8ff",
+}
+
+
+class CliError(Exception):
+    def __init__(self, error_type: str, message: str, details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.error_type = error_type
+        self.message = message
+        self.details = details or {}
+
+
+class JsonArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise CliError("invalid_arguments", message)
+
+    def exit(self, status: int = 0, message: str | None = None) -> None:
+        if status:
+            raise CliError("invalid_arguments", (message or "argument parsing failed").strip())
+        raise SystemExit(status)
+
+
+def success(action: str, result: dict[str, Any] | None = None, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "action": action,
+        "result": result or {},
+        "meta": meta or {},
+    }
+
+
+def failure(action: str, err_type: str, message: str, details: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "action": action,
+        "error": {
+            "type": err_type,
+            "message": message,
+            "details": details or {},
+        },
+    }
+
+
+def print_json(payload: dict[str, Any]) -> None:
+    print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+
+
+def parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError("expected boolean value: true/false")
+
+
+def parse_positive_float(value: str) -> float:
+    number = float(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return number
+
+
+def parse_brightness(value: str) -> float:
+    number = float(value)
+    if number < 0 or number > 100:
+        raise argparse.ArgumentTypeError("brightness must be between 0 and 100")
+    return round(number, 4)
+
+
+def parse_mirek(value: str) -> int:
+    number = int(value)
+    if number < 153 or number > 500:
+        raise argparse.ArgumentTypeError("mirek must be between 153 and 500")
+    return number
+
+
+def parse_xy(values: list[str]) -> tuple[float, float]:
+    if len(values) != 2:
+        raise CliError("invalid_arguments", "--xy requires exactly two numbers")
+    x = float(values[0])
+    y = float(values[1])
+    if not (0 <= x <= 1 and 0 <= y <= 1):
+        raise CliError("invalid_arguments", "xy values must be between 0 and 1", {"xy": [x, y]})
+    return (round(x, 6), round(y, 6))
+
+
+def normalize_name(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip().casefold()
+
+
+def load_simple_yaml(path: Path) -> dict[str, str]:
+    if not path.exists():
+        raise CliError("config_not_found", "Hue config file not found", {"path": str(path)})
+    data: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            raise CliError("config_invalid", "Invalid config line", {"line": raw_line, "path": str(path)})
+        key, value = line.split(":", 1)
+        data[key.strip()] = value.strip()
+    if not data.get("bridge") or not data.get("key"):
+        raise CliError("config_invalid", "Config must contain bridge and key", {"path": str(path)})
+    return data
+
+
+class HueClient:
+    def __init__(self, bridge: str, key: str, connect_timeout: float, read_timeout: float):
+        self.bridge = bridge
+        self.key = key
+        self.connect_timeout = connect_timeout
+        self.read_timeout = read_timeout
+        self.ssl_context = ssl._create_unverified_context()
+
+    def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        body = None if payload is None else json.dumps(payload).encode("utf-8")
+        headers = {
+            "hue-application-key": self.key,
+            "Accept": "application/json",
+        }
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+
+        conn = http.client.HTTPSConnection(
+            self.bridge,
+            timeout=self.connect_timeout,
+            context=self.ssl_context,
+        )
+        try:
+            conn.request(method, f"/{API_VERSION}/{path.lstrip('/')}", body=body, headers=headers)
+            if conn.sock is not None:
+                conn.sock.settimeout(self.read_timeout)
+            response = conn.getresponse()
+            raw = response.read()
+        except socket.timeout as exc:
+            raise CliError("timeout", "Hue bridge request timed out", {"bridge": self.bridge}) from exc
+        except OSError as exc:
+            raise CliError("bridge_unreachable", "Could not reach Hue bridge", {"bridge": self.bridge, "reason": str(exc)}) from exc
+        finally:
+            conn.close()
+
+        try:
+            parsed = json.loads(raw.decode("utf-8") or "{}")
+        except json.JSONDecodeError as exc:
+            raise CliError(
+                "unexpected_response",
+                "Hue bridge returned invalid JSON",
+                {"status": response.status, "body": raw.decode("utf-8", errors="replace")},
+            ) from exc
+
+        if response.status == 401 or response.status == 403:
+            raise CliError("authentication_failed", "Hue bridge rejected the application key", {"bridge": self.bridge})
+        if response.status >= 400:
+            raise CliError(
+                "api_rejected_request",
+                "Hue bridge rejected the request",
+                {"status": response.status, "response": parsed},
+            )
+        return parsed
+
+
+def pick_service_id(resource: dict[str, Any], service_type: str) -> str | None:
+    for service in resource.get("services", []):
+        if service.get("rtype") == service_type:
+            return service.get("rid")
+    return None
+
+
+def build_inventory(resources: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    devices = resources["device"]
+    lights = resources["light"]
+    rooms = resources["room"]
+    scenes = resources["scene"]
+    grouped_lights = resources["grouped_light"]
+
+    devices_by_id = {device["id"]: device for device in devices}
+    lights_by_id = {light["id"]: light for light in lights}
+    grouped_by_id = {grouped["id"]: grouped for grouped in grouped_lights}
+
+    device_to_light_ids: dict[str, list[str]] = {}
+    for device in devices:
+        light_ids = [service["rid"] for service in device.get("services", []) if service.get("rtype") == "light"]
+        device_to_light_ids[device["id"]] = light_ids
+
+    room_light_ids: dict[str, list[str]] = {}
+    for room in rooms:
+        resolved_light_ids: list[str] = []
+        for child in room.get("children", []):
+            rid = child.get("rid")
+            rtype = child.get("rtype")
+            if rtype == "light" and rid in lights_by_id:
+                resolved_light_ids.append(rid)
+            elif rtype == "device":
+                resolved_light_ids.extend(device_to_light_ids.get(rid, []))
+        room_light_ids[room["id"]] = list(dict.fromkeys(resolved_light_ids))
+
+    light_to_room_ids: dict[str, list[str]] = {}
+    for room_id, light_ids in room_light_ids.items():
+        for light_id in light_ids:
+            light_to_room_ids.setdefault(light_id, []).append(room_id)
+
+    room_scenes: dict[str, list[dict[str, Any]]] = {}
+    for scene in scenes:
+        group = scene.get("group") or {}
+        group_id = group.get("rid")
+        if group_id:
+            room_scenes.setdefault(group_id, []).append(scene)
+
+    def summarize_light(light: dict[str, Any]) -> dict[str, Any]:
+        room_ids = light_to_room_ids.get(light["id"], [])
+        room_names = [room["metadata"]["name"] for room in rooms if room["id"] in room_ids]
+        owner = light.get("owner") or {}
+        device = devices_by_id.get(owner.get("rid", ""))
+        return {
+            "id": light["id"],
+            "name": (light.get("metadata") or {}).get("name") or (device or {}).get("metadata", {}).get("name") or light["id"],
+            "on": ((light.get("on") or {}).get("on")),
+            "brightness": ((light.get("dimming") or {}).get("brightness")),
+            "mirek": ((light.get("color_temperature") or {}).get("mirek")),
+            "mirek_valid": ((light.get("color_temperature") or {}).get("mirek_valid")),
+            "xy": ((light.get("color") or {}).get("xy")),
+            "room_ids": room_ids,
+            "room_names": room_names,
+            "device_id": owner.get("rid"),
+            "raw": light,
+        }
+
+    def summarize_scene(scene: dict[str, Any]) -> dict[str, Any]:
+        group = scene.get("group") or {}
+        room = next((room for room in rooms if room["id"] == group.get("rid")), None)
+        return {
+            "id": scene["id"],
+            "name": (scene.get("metadata") or {}).get("name") or scene["id"],
+            "room_id": group.get("rid"),
+            "room_name": (room or {}).get("metadata", {}).get("name"),
+            "status": scene.get("status"),
+            "palette": scene.get("palette"),
+            "speed": scene.get("speed"),
+            "auto_dynamic": scene.get("auto_dynamic"),
+            "raw": scene,
+        }
+
+    def summarize_room(room: dict[str, Any]) -> dict[str, Any]:
+        member_lights = [summarize_light(lights_by_id[light_id]) for light_id in room_light_ids.get(room["id"], []) if light_id in lights_by_id]
+        grouped_light_id = pick_service_id(room, "grouped_light")
+        grouped_light = grouped_by_id.get(grouped_light_id) if grouped_light_id else None
+        return {
+            "id": room["id"],
+            "name": (room.get("metadata") or {}).get("name") or room["id"],
+            "grouped_light_id": grouped_light_id,
+            "grouped_on": ((grouped_light or {}).get("on") or {}).get("on"),
+            "lights": member_lights,
+            "scenes": [summarize_scene(scene) for scene in room_scenes.get(room["id"], [])],
+            "raw": room,
+        }
+
+    return {
+        "lights": [summarize_light(light) for light in lights],
+        "rooms": [summarize_room(room) for room in rooms],
+        "scenes": [summarize_scene(scene) for scene in scenes],
+    }
+
+
+def resolve_selector(items: list[dict[str, Any]], resource_type: str, item_id: str | None, item_name: str | None) -> dict[str, Any]:
+    if item_id and item_name:
+        raise CliError("invalid_arguments", f"Provide either --id or --name for {resource_type}, not both")
+    if not item_id and not item_name:
+        raise CliError("invalid_arguments", f"{resource_type} selector required", {"resource_type": resource_type})
+
+    if item_id:
+        matched = [item for item in items if item["id"] == item_id]
+    else:
+        normalized_name = normalize_name(item_name or "")
+        matched = [item for item in items if normalize_name(item.get("name", "")) == normalized_name]
+
+    if not matched:
+        raise CliError(
+            "resource_not_found",
+            f"No {resource_type} matched the selector",
+            {"id": item_id, "name": item_name},
+        )
+    if len(matched) > 1:
+        raise CliError(
+            "ambiguous_match",
+            f"Multiple {resource_type}s matched the selector",
+            {"id": item_id, "name": item_name, "matches": [{"id": item["id"], "name": item.get("name")} for item in matched]},
+        )
+    return matched[0]
+
+
+def resolve_optional_room_filter(items: list[dict[str, Any]], room_id: str | None, room_name: str | None) -> dict[str, Any] | None:
+    if not room_id and not room_name:
+        return None
+    return resolve_selector(items, "room", room_id, room_name)
+
+
+def parse_color(args: argparse.Namespace) -> dict[str, Any]:
+    if args.xy and args.hex:
+        raise CliError("invalid_arguments", "Provide either --xy or --hex, not both")
+    if args.xy:
+        x, y = parse_xy(args.xy)
+        return {"color": {"xy": {"x": x, "y": y}}}
+    if args.hex:
+        x, y = hex_to_xy(args.hex)
+        return {"color": {"xy": {"x": x, "y": y}}}
+    return {}
+
+
+def hex_to_xy(value: str) -> tuple[float, float]:
+    normalized = value.strip().lower()
+    normalized = CSS_COLOR_NAMES.get(normalized, normalized)
+    if normalized.startswith("#"):
+        normalized = normalized[1:]
+    if not re.fullmatch(r"[0-9a-f]{6}", normalized):
+        raise CliError("invalid_arguments", "hex color must be #RRGGBB or a supported color name", {"value": value})
+    red = int(normalized[0:2], 16) / 255.0
+    green = int(normalized[2:4], 16) / 255.0
+    blue = int(normalized[4:6], 16) / 255.0
+
+    def gamma_correct(channel: float) -> float:
+        if channel > 0.04045:
+            return ((channel + 0.055) / 1.055) ** 2.4
+        return channel / 12.92
+
+    red = gamma_correct(red)
+    green = gamma_correct(green)
+    blue = gamma_correct(blue)
+
+    x_val = red * 0.664511 + green * 0.154324 + blue * 0.162028
+    y_val = red * 0.283881 + green * 0.668433 + blue * 0.047685
+    z_val = red * 0.000088 + green * 0.07231 + blue * 0.986039
+    total = x_val + y_val + z_val
+    if total == 0:
+        raise CliError("invalid_arguments", "color conversion failed", {"value": value})
+    return (round(x_val / total, 6), round(y_val / total, 6))
+
+
+def build_light_payload(args: argparse.Namespace) -> dict[str, Any]:
+    return build_light_payload_from_values(
+        on=args.on,
+        brightness=args.brightness,
+        mirek=args.mirek,
+        xy=args.xy,
+        hex_value=args.hex,
+    )
+
+
+def build_light_payload_from_values(
+    *,
+    on: bool | None = None,
+    brightness: float | int | None = None,
+    mirek: int | None = None,
+    xy: list[Any] | tuple[Any, Any] | None = None,
+    hex_value: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if on is not None:
+        payload["on"] = {"on": on}
+    if brightness is not None:
+        payload["dimming"] = {"brightness": parse_brightness(str(brightness))}
+    if mirek is not None:
+        payload["color_temperature"] = {"mirek": parse_mirek(str(mirek))}
+    color_args = argparse.Namespace(xy=xy, hex=hex_value)
+    payload.update(parse_color(color_args))
+    if not payload:
+        raise CliError(
+            "invalid_arguments",
+            "At least one state field is required",
+            {"allowed_fields": ["on", "brightness", "mirek", "xy", "hex"]},
+        )
+    return payload
+
+
+def fetch_inventory(client: HueClient) -> dict[str, Any]:
+    resources = {
+        "device": (client.request("GET", "resource/device").get("data") or []),
+        "light": (client.request("GET", "resource/light").get("data") or []),
+        "room": (client.request("GET", "resource/room").get("data") or []),
+        "scene": (client.request("GET", "resource/scene").get("data") or []),
+        "grouped_light": (client.request("GET", "resource/grouped_light").get("data") or []),
+    }
+    return build_inventory(resources)
+
+
+def build_parser() -> JsonArgumentParser:
+    parser = JsonArgumentParser(prog="luxctl", add_help=False)
+    parser.add_argument("--help", action="store_true")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
+    parser.add_argument("--bridge")
+    parser.add_argument("--key")
+    parser.add_argument("--connect-timeout", type=parse_positive_float, default=DEFAULT_CONNECT_TIMEOUT)
+    parser.add_argument("--read-timeout", type=parse_positive_float, default=DEFAULT_READ_TIMEOUT)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--input-json")
+    parser.add_argument("--input")
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    subparsers.add_parser("list-actions", add_help=False)
+    subparsers.add_parser("schema", add_help=False)
+
+    get_parser = subparsers.add_parser("get", add_help=False)
+    get_subparsers = get_parser.add_subparsers(dest="resource")
+    for resource in ("light", "room", "scene"):
+        resource_parser = get_subparsers.add_parser(resource, add_help=False)
+        resource_parser.add_argument("--help", action="store_true")
+        resource_parser.add_argument("--id")
+        resource_parser.add_argument("--name")
+        if resource == "scene":
+            resource_parser.add_argument("--room-id")
+            resource_parser.add_argument("--room-name")
+
+    set_parser = subparsers.add_parser("set", add_help=False)
+    set_subparsers = set_parser.add_subparsers(dest="resource")
+
+    light_parser = set_subparsers.add_parser("light", add_help=False)
+    light_parser.add_argument("--help", action="store_true")
+    light_parser.add_argument("--id", action="append", default=[])
+    light_parser.add_argument("--name", action="append", default=[])
+    light_parser.add_argument("--on", type=parse_bool)
+    light_parser.add_argument("--brightness", type=parse_brightness)
+    light_parser.add_argument("--mirek", type=parse_mirek)
+    light_parser.add_argument("--xy", nargs=2)
+    light_parser.add_argument("--hex")
+
+    room_parser = set_subparsers.add_parser("room", add_help=False)
+    room_parser.add_argument("--help", action="store_true")
+    room_parser.add_argument("--id")
+    room_parser.add_argument("--name")
+    room_parser.add_argument("--on", type=parse_bool)
+    room_parser.add_argument("--brightness", type=parse_brightness)
+    room_parser.add_argument("--mirek", type=parse_mirek)
+    room_parser.add_argument("--xy", nargs=2)
+    room_parser.add_argument("--hex")
+    room_parser.add_argument("--exclude", action="append", default=[])
+
+    scene_parser = set_subparsers.add_parser("scene", add_help=False)
+    scene_parser.add_argument("--help", action="store_true")
+    scene_parser.add_argument("--id")
+    scene_parser.add_argument("--name")
+    scene_parser.add_argument("--room-id")
+    scene_parser.add_argument("--room-name")
+    scene_parser.add_argument("--action", default="active", choices=["active", "dynamic_palette", "static"])
+    scene_parser.add_argument("--duration-ms", type=int)
+
+    return parser
+
+
+def normalize_global_flags(argv: list[str]) -> list[str]:
+    value_flags = {
+        "--config",
+        "--bridge",
+        "--key",
+        "--connect-timeout",
+        "--read-timeout",
+        "--input-json",
+        "--input",
+    }
+    boolean_flags = {"--dry-run", "--help", "-h"}
+
+    globals_out: list[str] = []
+    remaining: list[str] = []
+    idx = 0
+    while idx < len(argv):
+        token = argv[idx]
+        if token in value_flags:
+            if idx + 1 >= len(argv):
+                raise CliError("invalid_arguments", f"{token} requires a value")
+            globals_out.extend([token, argv[idx + 1]])
+            idx += 2
+            continue
+        if token in boolean_flags:
+            globals_out.append(token)
+            idx += 1
+            continue
+        remaining.append(token)
+        idx += 1
+    return globals_out + remaining
+
+
+def build_help_payload(argv: list[str]) -> dict[str, Any]:
+    non_flag_tokens = [token for token in argv if not token.startswith("-")]
+    context = non_flag_tokens[:2]
+    return success(
+        "help",
+        {
+            "command_path": context or ["luxctl"],
+            "help": HELP_TREE,
+        },
+        {},
+    )
+
+
+def list_actions_payload() -> dict[str, Any]:
+    return success(
+        "list_actions",
+        {
+            "actions": SCHEMA["actions"],
+        },
+        {},
+    )
+
+
+def schema_payload() -> dict[str, Any]:
+    return success(
+        "schema",
+        {
+            "schema": SCHEMA,
+        },
+        {},
+    )
+
+
+def get_meta(client: HueClient, dry_run: bool = False) -> dict[str, Any]:
+    return {
+        "bridge_ip": client.bridge,
+        "api_version": "v2",
+        "dry_run": dry_run,
+    }
+
+
+def read_json_input(args: argparse.Namespace) -> dict[str, Any] | None:
+    if args.input_json and args.input:
+        raise CliError("invalid_arguments", "Provide either --input-json or --input, not both")
+    if args.input_json is None and args.input is None:
+        return None
+
+    if args.input_json is not None:
+        raw = args.input_json
+    else:
+        if args.input == "-":
+            raw = sys.stdin.read()
+        else:
+            raw = Path(args.input).read_text(encoding="utf-8")
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise CliError("invalid_arguments", "Input JSON is not valid JSON", {"reason": str(exc)}) from exc
+    if not isinstance(doc, dict):
+        raise CliError("invalid_arguments", "Input JSON must be a top-level object")
+    return doc
+
+
+def require_object(value: Any, field_name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise CliError("invalid_arguments", f"{field_name} must be an object")
+    return value
+
+
+def require_string_list(value: Any, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+        raise CliError("invalid_arguments", f"{field_name} must be a list of non-empty strings")
+    return value
+
+
+def validate_keys(value: dict[str, Any], allowed_keys: set[str], field_name: str) -> None:
+    unknown = sorted(set(value) - allowed_keys)
+    if unknown:
+        raise CliError("invalid_arguments", f"{field_name} contains unknown keys", {"field": field_name, "unknown_keys": unknown})
+
+
+def build_scene_payload(action: str = "active", duration_ms: int | None = None) -> dict[str, Any]:
+    if action not in {"active", "dynamic_palette", "static"}:
+        raise CliError("invalid_arguments", "scene action must be one of: active, dynamic_palette, static")
+    payload: dict[str, Any] = {"recall": {"action": action}}
+    if duration_ms is not None:
+        if not isinstance(duration_ms, int) or duration_ms < 0:
+            raise CliError("invalid_arguments", "duration_ms must be a non-negative integer")
+        payload["recall"]["duration"] = duration_ms
+    return payload
+
+
+def resolve_light_targets(
+    items: list[dict[str, Any]],
+    ids: list[str] | None,
+    names: list[str] | None,
+) -> list[dict[str, Any]]:
+    ids = ids or []
+    names = names or []
+    if not ids and not names:
+        raise CliError("invalid_arguments", "At least one light selector is required", {"resource_type": "light"})
+
+    resolved: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for item_id in ids:
+        matched = [item for item in items if item["id"] == item_id]
+        if not matched:
+            raise CliError("resource_not_found", "No light matched the selector", {"id": item_id})
+        light = matched[0]
+        if light["id"] not in seen_ids:
+            resolved.append(light)
+            seen_ids.add(light["id"])
+
+    for item_name in names:
+        normalized_name = normalize_name(item_name)
+        matched = [item for item in items if normalize_name(item.get("name", "")) == normalized_name]
+        if not matched:
+            raise CliError("resource_not_found", "No light matched the selector", {"name": item_name})
+        if len(matched) > 1:
+            raise CliError(
+                "ambiguous_match",
+                "Multiple lights matched the selector",
+                {"name": item_name, "matches": [{"id": item["id"], "name": item.get("name")} for item in matched]},
+            )
+        light = matched[0]
+        if light["id"] not in seen_ids:
+            resolved.append(light)
+            seen_ids.add(light["id"])
+
+    return resolved
+
+
+def execute_light_writes(
+    *,
+    action: str,
+    client: HueClient,
+    targets: list[dict[str, Any]],
+    payload: dict[str, Any],
+    dry_run: bool,
+    extra_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    base_result = dict(extra_result or {})
+    target_summaries = [{"id": light["id"], "name": light["name"]} for light in targets]
+
+    if dry_run:
+        if action == "set_light" and len(targets) == 1:
+            return success(action, {"target": targets[0], "payload": payload}, get_meta(client, dry_run=True))
+        base_result.update(
+            {
+                "payload": payload,
+                "targets": target_summaries,
+                "summary": {
+                    "target_count": len(targets),
+                    "success_count": 0,
+                    "failure_count": 0,
+                    "dry_run": True,
+                },
+            }
+        )
+        return success(action, base_result, get_meta(client, dry_run=True))
+
+    writes: list[dict[str, Any]] = []
+    success_count = 0
+    failure_count = 0
+    for light in targets:
+        try:
+            bridge_response = client.request("PUT", f"resource/light/{light['id']}", payload)
+            writes.append(
+                {
+                    "target": {"id": light["id"], "name": light["name"]},
+                    "ok": True,
+                    "bridge_response": bridge_response,
+                }
+            )
+            success_count += 1
+        except CliError as exc:
+            writes.append(
+                {
+                    "target": {"id": light["id"], "name": light["name"]},
+                    "ok": False,
+                    "error": {
+                        "type": exc.error_type,
+                        "message": exc.message,
+                        "details": exc.details,
+                    },
+                }
+            )
+            failure_count += 1
+
+    if action == "set_light" and len(targets) == 1 and failure_count == 0:
+        return success(
+            action,
+            {
+                "target": targets[0],
+                "applied": payload,
+                "bridge_response": writes[0]["bridge_response"],
+            },
+            get_meta(client),
+        )
+
+    base_result.update(
+        {
+            "payload": payload,
+            "targets": target_summaries,
+            "writes": writes,
+            "summary": {
+                "target_count": len(targets),
+                "success_count": success_count,
+                "failure_count": failure_count,
+                "dry_run": False,
+            },
+        }
+    )
+    return success(action, base_result, get_meta(client))
+
+
+def build_light_payload_from_json(doc: dict[str, Any]) -> dict[str, Any]:
+    validate_keys(doc, {"on", "brightness", "mirek", "xy", "hex"}, "payload")
+    return build_light_payload_from_values(
+        on=doc.get("on"),
+        brightness=doc.get("brightness"),
+        mirek=doc.get("mirek"),
+        xy=doc.get("xy"),
+        hex_value=doc.get("hex"),
+    )
+
+
+def handle_json_action(doc: dict[str, Any], args: argparse.Namespace, client: HueClient, inventory: dict[str, Any]) -> dict[str, Any]:
+    validate_keys(doc, {"action", "targets", "target", "payload", "exclude", "dry_run"}, "input")
+    action = doc.get("action")
+    if not isinstance(action, str) or not action:
+        raise CliError("invalid_arguments", "input.action must be a non-empty string")
+
+    if doc.get("dry_run") is not None and args.dry_run:
+        raise CliError("invalid_arguments", "dry_run must be specified either in JSON or by --dry-run, not both")
+    dry_run = bool(doc.get("dry_run", False) or args.dry_run)
+
+    if action == "set_light":
+        targets_doc = require_object(doc.get("targets"), "targets")
+        validate_keys(targets_doc, {"ids", "names"}, "targets")
+        targets = resolve_light_targets(
+            inventory["lights"],
+            require_string_list(targets_doc.get("ids"), "targets.ids"),
+            require_string_list(targets_doc.get("names"), "targets.names"),
+        )
+        payload = build_light_payload_from_json(require_object(doc.get("payload"), "payload"))
+        return execute_light_writes(action="set_light", client=client, targets=targets, payload=payload, dry_run=dry_run)
+
+    if action == "set_room":
+        target_doc = require_object(doc.get("target"), "target")
+        validate_keys(target_doc, {"id", "name"}, "target")
+        room = resolve_selector(inventory["rooms"], "room", target_doc.get("id"), target_doc.get("name"))
+        payload = build_light_payload_from_json(require_object(doc.get("payload"), "payload"))
+        exclude = require_string_list(doc.get("exclude"), "exclude")
+        targets, excluded = resolve_excluded_lights(room, exclude)
+        if not targets:
+            raise CliError("invalid_arguments", "No target lights remain after exclusions", {"room_id": room["id"], "exclude": exclude})
+        return execute_light_writes(
+            action="set_room",
+            client=client,
+            targets=targets,
+            payload=payload,
+            dry_run=dry_run,
+            extra_result={
+                "room": {"id": room["id"], "name": room["name"]},
+                "target_lights": [{"id": light["id"], "name": light["name"]} for light in targets],
+                "excluded_lights": [{"id": light["id"], "name": light["name"]} for light in excluded],
+            },
+        )
+
+    if action == "set_scene":
+        target_doc = require_object(doc.get("target"), "target")
+        validate_keys(target_doc, {"id", "name", "room_id", "room_name"}, "target")
+        payload_doc = require_object(doc.get("payload"), "payload")
+        validate_keys(payload_doc, {"action", "duration_ms"}, "payload")
+        room = resolve_optional_room_filter(inventory["rooms"], target_doc.get("room_id"), target_doc.get("room_name"))
+        scenes = inventory["scenes"]
+        if room is not None:
+            scenes = [scene for scene in scenes if scene.get("room_id") == room["id"]]
+        scene = resolve_selector(scenes, "scene", target_doc.get("id"), target_doc.get("name"))
+        payload = build_scene_payload(action=payload_doc.get("action", "active"), duration_ms=payload_doc.get("duration_ms"))
+        if dry_run:
+            return success("set_scene", {"scene": scene, "payload": payload}, get_meta(client, dry_run=True))
+        response = client.request("PUT", f"resource/scene/{scene['id']}", payload)
+        return success("set_scene", {"scene": scene, "applied": payload, "bridge_response": response}, get_meta(client))
+
+    raise CliError("invalid_arguments", "Unsupported JSON action", {"action": action})
+
+
+def handle_get(args: argparse.Namespace, inventory: dict[str, Any], client: HueClient) -> dict[str, Any]:
+    action = f"get_{args.resource}"
+    if args.resource == "light":
+        items = inventory["lights"]
+        selected = resolve_selector(items, "light", args.id, args.name) if args.id or args.name else None
+    elif args.resource == "room":
+        items = inventory["rooms"]
+        selected = resolve_selector(items, "room", args.id, args.name) if args.id or args.name else None
+    else:
+        items = inventory["scenes"]
+        room = resolve_optional_room_filter(inventory["rooms"], args.room_id, args.room_name)
+        filtered = [scene for scene in items if room is None or scene.get("room_id") == room["id"]]
+        items = filtered
+        selected = resolve_selector(items, "scene", args.id, args.name) if args.id or args.name else None
+
+    result_key = f"{args.resource}s"
+    result = {result_key: items} if selected is None else {args.resource: selected}
+    return success(action, result, get_meta(client))
+
+
+def resolve_excluded_lights(room: dict[str, Any], exclude_values: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    room_lights = room["lights"]
+    if not exclude_values:
+        return (room_lights, [])
+
+    excluded: list[dict[str, Any]] = []
+    excluded_ids: set[str] = set()
+    for value in exclude_values:
+        exact_id = next((light for light in room_lights if light["id"] == value), None)
+        if exact_id is not None:
+            excluded.append(exact_id)
+            excluded_ids.add(exact_id["id"])
+            continue
+        name_matches = [light for light in room_lights if normalize_name(light["name"]) == normalize_name(value)]
+        if not name_matches:
+            raise CliError("resource_not_found", "Excluded light not found in room", {"exclude": value, "room_id": room["id"]})
+        if len(name_matches) > 1:
+            raise CliError(
+                "ambiguous_match",
+                "Excluded light name matched multiple lights in room",
+                {"exclude": value, "matches": [{"id": light["id"], "name": light["name"]} for light in name_matches]},
+            )
+        excluded.append(name_matches[0])
+        excluded_ids.add(name_matches[0]["id"])
+
+    targets = [light for light in room_lights if light["id"] not in excluded_ids]
+    return (targets, excluded)
+
+
+def handle_set_light(args: argparse.Namespace, client: HueClient, inventory: dict[str, Any]) -> dict[str, Any]:
+    targets = resolve_light_targets(inventory["lights"], args.id, args.name)
+    payload = build_light_payload(args)
+    return execute_light_writes(action="set_light", client=client, targets=targets, payload=payload, dry_run=args.dry_run)
+
+
+def handle_set_room(args: argparse.Namespace, client: HueClient, inventory: dict[str, Any]) -> dict[str, Any]:
+    room = resolve_selector(inventory["rooms"], "room", args.id, args.name)
+    payload = build_light_payload(args)
+    targets, excluded = resolve_excluded_lights(room, args.exclude)
+    if not targets:
+        raise CliError("invalid_arguments", "No target lights remain after exclusions", {"room_id": room["id"], "exclude": args.exclude})
+    plan = {
+        "room": {"id": room["id"], "name": room["name"]},
+        "target_lights": [{"id": light["id"], "name": light["name"]} for light in targets],
+        "excluded_lights": [{"id": light["id"], "name": light["name"]} for light in excluded],
+    }
+    return execute_light_writes(action="set_room", client=client, targets=targets, payload=payload, dry_run=args.dry_run, extra_result=plan)
+
+
+def handle_set_scene(args: argparse.Namespace, client: HueClient, inventory: dict[str, Any]) -> dict[str, Any]:
+    room = resolve_optional_room_filter(inventory["rooms"], args.room_id, args.room_name)
+    scenes = inventory["scenes"]
+    if room is not None:
+        scenes = [scene for scene in scenes if scene.get("room_id") == room["id"]]
+    scene = resolve_selector(scenes, "scene", args.id, args.name)
+
+    payload: dict[str, Any] = {"recall": {"action": args.action}}
+    if args.duration_ms is not None:
+        if args.duration_ms < 0:
+            raise CliError("invalid_arguments", "--duration-ms must be non-negative")
+        payload["recall"]["duration"] = args.duration_ms
+
+    if args.dry_run:
+        return success(
+            "set_scene",
+            {"scene": scene, "payload": payload},
+            get_meta(client, dry_run=True),
+        )
+
+    response = client.request("PUT", f"resource/scene/{scene['id']}", payload)
+    return success(
+        "set_scene",
+        {"scene": scene, "applied": payload, "bridge_response": response},
+        get_meta(client),
+    )
+
+
+def load_runtime_config(args: argparse.Namespace) -> tuple[HueClient, Path]:
+    config_path = Path(args.config).expanduser()
+    config = load_simple_yaml(config_path)
+    bridge = args.bridge or config["bridge"]
+    key = args.key or config["key"]
+    return (
+        HueClient(
+            bridge=bridge,
+            key=key,
+            connect_timeout=args.connect_timeout,
+            read_timeout=args.read_timeout,
+        ),
+        config_path,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    argv = normalize_global_flags(argv)
+    if not argv or "--help" in argv or "-h" in argv:
+        print_json(build_help_payload(argv))
+        return 0
+
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+        if args.command == "list-actions":
+            print_json(list_actions_payload())
+            return 0
+        if args.command == "schema":
+            print_json(schema_payload())
+            return 0
+        input_doc = read_json_input(args)
+        if input_doc is not None:
+            if args.command is not None:
+                raise CliError("invalid_arguments", "JSON input mode cannot be combined with command arguments")
+            client, _config_path = load_runtime_config(args)
+            inventory = fetch_inventory(client)
+            print_json(handle_json_action(input_doc, args, client, inventory))
+            return 0
+        if not args.command:
+            raise CliError("invalid_arguments", "A command is required")
+        client, _config_path = load_runtime_config(args)
+        if args.command == "get":
+            inventory = fetch_inventory(client)
+            print_json(handle_get(args, inventory, client))
+            return 0
+        if args.command == "set":
+            inventory = fetch_inventory(client)
+            if args.resource == "light":
+                print_json(handle_set_light(args, client, inventory))
+                return 0
+            if args.resource == "room":
+                print_json(handle_set_room(args, client, inventory))
+                return 0
+            if args.resource == "scene":
+                print_json(handle_set_scene(args, client, inventory))
+                return 0
+            raise CliError("invalid_arguments", "A set resource is required")
+        raise CliError("invalid_arguments", "Unknown command")
+    except CliError as exc:
+        print_json(failure(args_to_action(argv), exc.error_type, exc.message, exc.details))
+        return 1
+
+
+def args_to_action(argv: list[str]) -> str:
+    value_flags = {
+        "--config",
+        "--bridge",
+        "--key",
+        "--connect-timeout",
+        "--read-timeout",
+        "--input-json",
+        "--input",
+    }
+    boolean_flags = {"--dry-run", "--help", "-h"}
+    tokens: list[str] = []
+    idx = 0
+    while idx < len(argv):
+        token = argv[idx]
+        if token in value_flags:
+            idx += 2
+            continue
+        if token in boolean_flags or token.startswith("-"):
+            idx += 1
+            continue
+        tokens.append(token)
+        idx += 1
+    if not tokens:
+        if "--input-json" in argv or "--input" in argv:
+            return "json_input"
+        return "help"
+    if len(tokens) >= 2 and tokens[0] in {"get", "set"}:
+        return f"{tokens[0]}_{tokens[1]}"
+    return tokens[0].replace("-", "_")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
