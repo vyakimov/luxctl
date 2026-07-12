@@ -77,17 +77,35 @@ luxctl reads bridge credentials from `~/.openhue/config.yaml` by default:
 ```yaml
 bridge: 192.168.1.100
 key: your-hue-application-key
+# ca_cert: ~/.openhue/bridge-cert.pem   # optional, enables TLS verification
 ```
 
-Override with `--config`, `--bridge`, or `--key`.
+Credentials resolve in priority order: command-line flags, then environment variables (`LUXCTL_BRIDGE`, `LUXCTL_KEY`, `LUXCTL_CA_CERT`), then the config file. If both bridge and key are supplied via flags or environment, no config file is needed.
 
 | Flag | Default | Purpose |
 |---|---|---|
 | `--config` | `~/.openhue/config.yaml` | Path to config file |
-| `--bridge` | from config | Bridge IP or hostname |
-| `--key` | from config | Hue application key |
+| `--bridge` | `LUXCTL_BRIDGE` env, then config | Bridge IP or hostname |
+| `--key` | `LUXCTL_KEY` env, then config | Hue application key |
+| `--ca-cert` | `LUXCTL_CA_CERT` env, then config | CA/bridge certificate for TLS verification |
 | `--connect-timeout` | `5.0` | HTTP connect timeout (seconds) |
 | `--read-timeout` | `10.0` | HTTP read timeout (seconds) |
+| `--version` | | Print the luxctl version as JSON |
+
+### TLS verification
+
+Hue bridges serve a self-signed certificate by default, so luxctl skips certificate verification unless you opt in. To pin your bridge's certificate:
+
+```bash
+# Capture the bridge certificate once
+openssl s_client -connect <BRIDGE_IP>:443 -showcerts </dev/null 2>/dev/null \
+  | openssl x509 > ~/.openhue/bridge-cert.pem
+
+# Verify against it on every call
+./luxctl --ca-cert ~/.openhue/bridge-cert.pem get light
+```
+
+With a pinned certificate the chain is verified (a mismatch fails with error type `tls_verification_failed`); hostname verification stays off because the bridge certificate's common name is the bridge ID, not its IP.
 
 ## Usage
 
@@ -222,15 +240,25 @@ Every response is a JSON object. No exceptions.
 | `config_not_found` | Config file missing |
 | `config_invalid` | Config file malformed or missing required fields |
 | `bridge_unreachable` | Cannot connect to the Hue bridge |
+| `tls_verification_failed` | Bridge certificate failed verification against `--ca-cert` |
 | `authentication_failed` | Bridge rejected the application key |
 | `api_rejected_request` | Bridge returned an HTTP error |
 | `resource_not_found` | No light/room/scene matched the selector |
 | `ambiguous_match` | Multiple resources matched a name selector |
 | `timeout` | Bridge request timed out |
 | `unexpected_response` | Bridge returned invalid JSON |
+| `internal_error` | Unexpected failure inside luxctl (still reported as JSON) |
 
 ## Color Support
 
 Set colors with `--hex` (hex codes or CSS names), `--xy` (CIE coordinates), or `--mirek` (color temperature).
 
 Supported CSS names: `black`, `white`, `red`, `green`, `blue`, `yellow`, `orange`, `purple`, `pink`, `cyan`, `magenta`, `warmwhite`, `coolwhite`
+
+## Development
+
+luxctl is a single file with no dependencies beyond the Python 3.10+ standard library. Tests use `unittest` and run without a bridge:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
