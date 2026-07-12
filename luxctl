@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
+VERSION = "0.2.0"
 API_VERSION = "clip/v2"
 DEFAULT_CONFIG_PATH = Path.home() / ".openhue" / "config.yaml"
 DEFAULT_CONNECT_TIMEOUT = 5.0
@@ -77,13 +78,15 @@ HELP_TREE: dict[str, Any] = {
     },
     "global_options": {
         "--config": "Path to config YAML with bridge/key entries.",
-        "--bridge": "Override bridge IP or hostname.",
-        "--key": "Override Hue application key.",
+        "--bridge": "Override bridge IP or hostname (or LUXCTL_BRIDGE env var).",
+        "--key": "Override Hue application key (or LUXCTL_KEY env var).",
+        "--ca-cert": "Path to a CA/bridge certificate to verify the bridge TLS connection (or LUXCTL_CA_CERT env var).",
         "--connect-timeout": "HTTP connect timeout in seconds.",
         "--read-timeout": "HTTP read timeout in seconds.",
         "--dry-run": "Validate mutating command and return planned writes without sending them.",
         "--input-json": "Structured JSON mutation payload passed inline.",
         "--input": "Structured JSON mutation payload from a file path or '-' for stdin.",
+        "--version": "Return the luxctl version as JSON.",
         "--help": "Return this help as JSON.",
     },
 }
@@ -149,12 +152,14 @@ SCHEMA: dict[str, Any] = {
         "config_not_found",
         "config_invalid",
         "bridge_unreachable",
+        "tls_verification_failed",
         "authentication_failed",
         "api_rejected_request",
         "resource_not_found",
         "ambiguous_match",
         "timeout",
         "unexpected_response",
+        "internal_error",
     ],
     "json_input": {
         "transport": {
@@ -242,41 +247,58 @@ def print_json(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
 
 
-def parse_bool(value: str) -> bool:
-    normalized = value.strip().lower()
-    if normalized in {"true", "1", "yes", "on"}:
-        return True
-    if normalized in {"false", "0", "no", "off"}:
-        return False
-    raise argparse.ArgumentTypeError("expected boolean value: true/false")
+def parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    raise CliError("invalid_arguments", "expected boolean value: true/false", {"value": value})
 
 
-def parse_positive_float(value: str) -> float:
-    number = float(value)
+def parse_number(value: Any, field_name: str) -> float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            pass
+    raise CliError("invalid_arguments", f"{field_name} must be a number", {"value": value})
+
+
+def parse_positive_float(value: Any) -> float:
+    number = parse_number(value, "timeout")
     if number <= 0:
-        raise argparse.ArgumentTypeError("must be greater than 0")
+        raise CliError("invalid_arguments", "timeout must be greater than 0", {"value": value})
     return number
 
 
-def parse_brightness(value: str) -> float:
-    number = float(value)
+def parse_brightness(value: Any) -> float:
+    number = parse_number(value, "brightness")
     if number < 0 or number > 100:
-        raise argparse.ArgumentTypeError("brightness must be between 0 and 100")
+        raise CliError("invalid_arguments", "brightness must be between 0 and 100", {"value": value})
     return round(number, 4)
 
 
-def parse_mirek(value: str) -> int:
-    number = int(value)
-    if number < 153 or number > 500:
-        raise argparse.ArgumentTypeError("mirek must be between 153 and 500")
-    return number
+def parse_mirek(value: Any) -> int:
+    number = parse_number(value, "mirek")
+    if not number.is_integer():
+        raise CliError("invalid_arguments", "mirek must be an integer", {"value": value})
+    mirek = int(number)
+    if mirek < 153 or mirek > 500:
+        raise CliError("invalid_arguments", "mirek must be between 153 and 500", {"value": value})
+    return mirek
 
 
-def parse_xy(values: list[str]) -> tuple[float, float]:
-    if len(values) != 2:
-        raise CliError("invalid_arguments", "--xy requires exactly two numbers")
-    x = float(values[0])
-    y = float(values[1])
+def parse_xy(values: Any) -> tuple[float, float]:
+    if not isinstance(values, (list, tuple)) or len(values) != 2:
+        raise CliError("invalid_arguments", "xy requires exactly two numbers")
+    x = parse_number(values[0], "xy[0]")
+    y = parse_number(values[1], "xy[1]")
     if not (0 <= x <= 1 and 0 <= y <= 1):
         raise CliError("invalid_arguments", "xy values must be between 0 and 1", {"xy": [x, y]})
     return (round(x, 6), round(y, 6))
@@ -297,19 +319,39 @@ def load_simple_yaml(path: Path) -> dict[str, str]:
         if ":" not in line:
             raise CliError("config_invalid", "Invalid config line", {"line": raw_line, "path": str(path)})
         key, value = line.split(":", 1)
-        data[key.strip()] = value.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        data[key.strip()] = value
     if not data.get("bridge") or not data.get("key"):
         raise CliError("config_invalid", "Config must contain bridge and key", {"path": str(path)})
     return data
 
 
+def build_ssl_context(ca_cert: str | None) -> ssl.SSLContext:
+    if ca_cert:
+        try:
+            context = ssl.create_default_context(cafile=str(Path(ca_cert).expanduser()))
+        except (OSError, ssl.SSLError) as exc:
+            raise CliError("config_invalid", "Could not load CA certificate", {"ca_cert": ca_cert, "reason": str(exc)}) from exc
+        # Hue bridge certificates carry the bridge ID as their common name, not
+        # the bridge IP, so the certificate chain is verified but the hostname
+        # cannot be.
+        context.check_hostname = False
+        return context
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
 class HueClient:
-    def __init__(self, bridge: str, key: str, connect_timeout: float, read_timeout: float):
+    def __init__(self, bridge: str, key: str, connect_timeout: float, read_timeout: float, ca_cert: str | None = None):
         self.bridge = bridge
         self.key = key
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
-        self.ssl_context = ssl._create_unverified_context()
+        self.ssl_context = build_ssl_context(ca_cert)
 
     def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         body = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -333,10 +375,19 @@ class HueClient:
             raw = response.read()
         except socket.timeout as exc:
             raise CliError("timeout", "Hue bridge request timed out", {"bridge": self.bridge}) from exc
+        except ssl.SSLCertVerificationError as exc:
+            raise CliError(
+                "tls_verification_failed",
+                "Hue bridge TLS certificate could not be verified against the configured CA certificate",
+                {"bridge": self.bridge, "reason": str(exc)},
+            ) from exc
         except OSError as exc:
             raise CliError("bridge_unreachable", "Could not reach Hue bridge", {"bridge": self.bridge, "reason": str(exc)}) from exc
         finally:
             conn.close()
+
+        if response.status == 401 or response.status == 403:
+            raise CliError("authentication_failed", "Hue bridge rejected the application key", {"bridge": self.bridge})
 
         try:
             parsed = json.loads(raw.decode("utf-8") or "{}")
@@ -346,9 +397,6 @@ class HueClient:
                 "Hue bridge returned invalid JSON",
                 {"status": response.status, "body": raw.decode("utf-8", errors="replace")},
             ) from exc
-
-        if response.status == 401 or response.status == 403:
-            raise CliError("authentication_failed", "Hue bridge rejected the application key", {"bridge": self.bridge})
         if response.status >= 400:
             raise CliError(
                 "api_rejected_request",
@@ -505,7 +553,9 @@ def parse_color(args: argparse.Namespace) -> dict[str, Any]:
     return {}
 
 
-def hex_to_xy(value: str) -> tuple[float, float]:
+def hex_to_xy(value: Any) -> tuple[float, float]:
+    if not isinstance(value, str):
+        raise CliError("invalid_arguments", "hex color must be a string", {"value": value})
     normalized = value.strip().lower()
     normalized = CSS_COLOR_NAMES.get(normalized, normalized)
     if normalized.startswith("#"):
@@ -554,11 +604,11 @@ def build_light_payload_from_values(
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     if on is not None:
-        payload["on"] = {"on": on}
+        payload["on"] = {"on": parse_bool(on)}
     if brightness is not None:
-        payload["dimming"] = {"brightness": parse_brightness(str(brightness))}
+        payload["dimming"] = {"brightness": parse_brightness(brightness)}
     if mirek is not None:
-        payload["color_temperature"] = {"mirek": parse_mirek(str(mirek))}
+        payload["color_temperature"] = {"mirek": parse_mirek(mirek)}
     color_args = argparse.Namespace(xy=xy, hex=hex_value)
     payload.update(parse_color(color_args))
     if not payload:
@@ -584,9 +634,11 @@ def fetch_inventory(client: HueClient) -> dict[str, Any]:
 def build_parser() -> JsonArgumentParser:
     parser = JsonArgumentParser(prog="luxctl", add_help=False)
     parser.add_argument("--help", action="store_true")
+    parser.add_argument("--version", action="store_true")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
     parser.add_argument("--bridge")
     parser.add_argument("--key")
+    parser.add_argument("--ca-cert")
     parser.add_argument("--connect-timeout", type=parse_positive_float, default=DEFAULT_CONNECT_TIMEOUT)
     parser.add_argument("--read-timeout", type=parse_positive_float, default=DEFAULT_READ_TIMEOUT)
     parser.add_argument("--dry-run", action="store_true")
@@ -645,17 +697,22 @@ def build_parser() -> JsonArgumentParser:
     return parser
 
 
+GLOBAL_VALUE_FLAGS = {
+    "--config",
+    "--bridge",
+    "--key",
+    "--ca-cert",
+    "--connect-timeout",
+    "--read-timeout",
+    "--input-json",
+    "--input",
+}
+GLOBAL_BOOLEAN_FLAGS = {"--dry-run", "--version", "--help", "-h"}
+
+
 def normalize_global_flags(argv: list[str]) -> list[str]:
-    value_flags = {
-        "--config",
-        "--bridge",
-        "--key",
-        "--connect-timeout",
-        "--read-timeout",
-        "--input-json",
-        "--input",
-    }
-    boolean_flags = {"--dry-run", "--help", "-h"}
+    value_flags = GLOBAL_VALUE_FLAGS
+    boolean_flags = GLOBAL_BOOLEAN_FLAGS
 
     globals_out: list[str] = []
     remaining: list[str] = []
@@ -730,7 +787,10 @@ def read_json_input(args: argparse.Namespace) -> dict[str, Any] | None:
         if args.input == "-":
             raw = sys.stdin.read()
         else:
-            raw = Path(args.input).read_text(encoding="utf-8")
+            try:
+                raw = Path(args.input).read_text(encoding="utf-8")
+            except OSError as exc:
+                raise CliError("invalid_arguments", "Could not read input file", {"path": args.input, "reason": str(exc)}) from exc
     try:
         doc = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -765,8 +825,8 @@ def build_scene_payload(action: str = "active", duration_ms: int | None = None) 
         raise CliError("invalid_arguments", "scene action must be one of: active, dynamic_palette, static")
     payload: dict[str, Any] = {"recall": {"action": action}}
     if duration_ms is not None:
-        if not isinstance(duration_ms, int) or duration_ms < 0:
-            raise CliError("invalid_arguments", "duration_ms must be a non-negative integer")
+        if isinstance(duration_ms, bool) or not isinstance(duration_ms, int) or duration_ms < 0:
+            raise CliError("invalid_arguments", "duration_ms must be a non-negative integer", {"value": duration_ms})
         payload["recall"]["duration"] = duration_ms
     return payload
 
@@ -953,7 +1013,7 @@ def handle_json_action(doc: dict[str, Any], args: argparse.Namespace, client: Hu
     if action == "set_scene":
         target_doc = require_object(doc.get("target"), "target")
         validate_keys(target_doc, {"id", "name", "room_id", "room_name"}, "target")
-        payload_doc = require_object(doc.get("payload"), "payload")
+        payload_doc = require_object(doc.get("payload"), "payload") if doc.get("payload") is not None else {}
         validate_keys(payload_doc, {"action", "duration_ms"}, "payload")
         room = resolve_optional_room_filter(inventory["rooms"], target_doc.get("room_id"), target_doc.get("room_name"))
         scenes = inventory["scenes"]
@@ -1044,12 +1104,7 @@ def handle_set_scene(args: argparse.Namespace, client: HueClient, inventory: dic
     if room is not None:
         scenes = [scene for scene in scenes if scene.get("room_id") == room["id"]]
     scene = resolve_selector(scenes, "scene", args.id, args.name)
-
-    payload: dict[str, Any] = {"recall": {"action": args.action}}
-    if args.duration_ms is not None:
-        if args.duration_ms < 0:
-            raise CliError("invalid_arguments", "--duration-ms must be non-negative")
-        payload["recall"]["duration"] = args.duration_ms
+    payload = build_scene_payload(action=args.action, duration_ms=args.duration_ms)
 
     if args.dry_run:
         return success(
@@ -1066,31 +1121,36 @@ def handle_set_scene(args: argparse.Namespace, client: HueClient, inventory: dic
     )
 
 
-def load_runtime_config(args: argparse.Namespace) -> tuple[HueClient, Path]:
-    config_path = Path(args.config).expanduser()
-    config = load_simple_yaml(config_path)
-    bridge = args.bridge or config["bridge"]
-    key = args.key or config["key"]
-    return (
-        HueClient(
-            bridge=bridge,
-            key=key,
-            connect_timeout=args.connect_timeout,
-            read_timeout=args.read_timeout,
-        ),
-        config_path,
+def load_runtime_config(args: argparse.Namespace) -> HueClient:
+    bridge = args.bridge or os.environ.get("LUXCTL_BRIDGE")
+    key = args.key or os.environ.get("LUXCTL_KEY")
+    ca_cert = args.ca_cert or os.environ.get("LUXCTL_CA_CERT")
+    if not bridge or not key:
+        config = load_simple_yaml(Path(args.config).expanduser())
+        bridge = bridge or config["bridge"]
+        key = key or config["key"]
+        ca_cert = ca_cert or config.get("ca_cert")
+    return HueClient(
+        bridge=bridge,
+        key=key,
+        connect_timeout=args.connect_timeout,
+        read_timeout=args.read_timeout,
+        ca_cert=ca_cert,
     )
 
 
 def main(argv: list[str] | None = None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    argv = normalize_global_flags(argv)
-    if not argv or "--help" in argv or "-h" in argv:
-        print_json(build_help_payload(argv))
-        return 0
-
-    parser = build_parser()
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     try:
+        argv = normalize_global_flags(raw_argv)
+        if not argv or "--help" in argv or "-h" in argv:
+            print_json(build_help_payload(argv))
+            return 0
+        if "--version" in argv:
+            print_json(success("version", {"version": VERSION}))
+            return 0
+
+        parser = build_parser()
         args = parser.parse_args(argv)
         if args.command == "list-actions":
             print_json(list_actions_payload())
@@ -1102,13 +1162,15 @@ def main(argv: list[str] | None = None) -> int:
         if input_doc is not None:
             if args.command is not None:
                 raise CliError("invalid_arguments", "JSON input mode cannot be combined with command arguments")
-            client, _config_path = load_runtime_config(args)
+            client = load_runtime_config(args)
             inventory = fetch_inventory(client)
             print_json(handle_json_action(input_doc, args, client, inventory))
             return 0
         if not args.command:
             raise CliError("invalid_arguments", "A command is required")
-        client, _config_path = load_runtime_config(args)
+        if args.command in {"get", "set"} and args.resource not in {"light", "room", "scene"}:
+            raise CliError("invalid_arguments", f"A {args.command} resource is required: light, room, or scene")
+        client = load_runtime_config(args)
         if args.command == "get":
             inventory = fetch_inventory(client)
             print_json(handle_get(args, inventory, client))
@@ -1121,27 +1183,20 @@ def main(argv: list[str] | None = None) -> int:
             if args.resource == "room":
                 print_json(handle_set_room(args, client, inventory))
                 return 0
-            if args.resource == "scene":
-                print_json(handle_set_scene(args, client, inventory))
-                return 0
-            raise CliError("invalid_arguments", "A set resource is required")
+            print_json(handle_set_scene(args, client, inventory))
+            return 0
         raise CliError("invalid_arguments", "Unknown command")
     except CliError as exc:
-        print_json(failure(args_to_action(argv), exc.error_type, exc.message, exc.details))
+        print_json(failure(args_to_action(raw_argv), exc.error_type, exc.message, exc.details))
+        return 1
+    except Exception as exc:  # the JSON-only contract must hold even for bugs
+        print_json(failure(args_to_action(raw_argv), "internal_error", f"{type(exc).__name__}: {exc}"))
         return 1
 
 
 def args_to_action(argv: list[str]) -> str:
-    value_flags = {
-        "--config",
-        "--bridge",
-        "--key",
-        "--connect-timeout",
-        "--read-timeout",
-        "--input-json",
-        "--input",
-    }
-    boolean_flags = {"--dry-run", "--help", "-h"}
+    value_flags = GLOBAL_VALUE_FLAGS
+    boolean_flags = GLOBAL_BOOLEAN_FLAGS
     tokens: list[str] = []
     idx = 0
     while idx < len(argv):
@@ -1157,6 +1212,8 @@ def args_to_action(argv: list[str]) -> str:
     if not tokens:
         if "--input-json" in argv or "--input" in argv:
             return "json_input"
+        if "--version" in argv:
+            return "version"
         return "help"
     if len(tokens) >= 2 and tokens[0] in {"get", "set"}:
         return f"{tokens[0]}_{tokens[1]}"

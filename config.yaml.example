@@ -1,2 +1,6 @@
 bridge: 192.168.1.100
 key: your-hue-application-key
+# Optional: verify the bridge TLS certificate against this CA/certificate file.
+# When omitted, TLS certificate verification is disabled (the bridge uses a
+# self-signed certificate by default).
+# ca_cert: ~/.openhue/bridge-cert.pem
