@@ -24,3 +24,11 @@ jobs:
           ./luxctl schema | python -c "import json,sys; assert json.load(sys.stdin)['ok']"
           ./luxctl --help | python -c "import json,sys; assert json.load(sys.stdin)['ok']"
           ./luxctl get | python -c "import json,sys; assert json.load(sys.stdin)['ok'] is False"
+      - name: Smoke test (offline gating)
+        run: |
+          ./luxctl get light | python -c "
+          import json,sys; d=json.load(sys.stdin)
+          assert d['error']['type'] == 'selector_required', d"
+          ./luxctl --raw get light --all | python -c "
+          import json,sys; d=json.load(sys.stdin)
+          assert d['error']['type'] == 'invalid_arguments', d"

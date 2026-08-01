@@ -1,0 +1,46 @@
+{
+  "skill_name": "luxctl",
+  "notes": "Runs execute against mock_bridge.py, a fake Hue V2 bridge serving 30 lights / 6 rooms / 24 scenes. Every HTTP request is logged to requests.jsonl, so runs are graded on what the caller actually did, not on what it reports.",
+  "evals": [
+    {
+      "id": 0,
+      "name": "turn-off-all-lights",
+      "prompt": "Turn off all the lights.",
+      "expected_output": "One `set light --all --on false` call. No full-inventory read, and certainly no per-light fan-out. Reports back how many lights were turned off.",
+      "expectations": [
+        "All 30 lights end up off",
+        "Did not run a full inventory read (`get light --all`) before writing",
+        "Used an --all bulk primitive rather than enumerating lights",
+        "Used at most 2 luxctl invocations",
+        "Reported the outcome to the user in plain language, including how many lights"
+      ]
+    },
+    {
+      "id": 1,
+      "name": "which-lights-are-on",
+      "prompt": "Is anything still on? Which ones?",
+      "expected_output": "A `get light --on true` call, and a plain-language list of the lights that are on. Should not pull the whole inventory and filter client-side.",
+      "expectations": [
+        "Used the --on filter rather than listing every light",
+        "Did not request the raw view",
+        "Named the lights that are on using their human-readable names",
+        "Did not act on a truncated list without noticing",
+        "Made no state-changing PUT requests"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "dim-room-with-exclusion",
+      "prompt": "Dim the bedroom to 30% and make it a bit warmer, but leave the night light alone.",
+      "expected_output": "A single `set room --ref bedroom --brightness 30 --mirek <higher> --exclude night-light` call. Warmer means a higher mirek. The night light must not be written to.",
+      "expectations": [
+        "Targeted the bedroom as a room rather than enumerating its lights",
+        "Used --exclude to spare the night light",
+        "The night light received no PUT",
+        "Set brightness to 30",
+        "Raised the mirek value (warmer), rather than lowering it",
+        "Combined the changes into a single call rather than several"
+      ]
+    }
+  ]
+}
